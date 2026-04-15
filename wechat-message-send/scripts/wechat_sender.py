@@ -346,46 +346,73 @@ def find_wechat_window(path_filter: Optional[Path]) -> int:
         raise SendError("No running WeChat process was found.")
 
     fallback_main_hwnd: Optional[int] = None
+    fallback_visible_hwnd: Optional[int] = None
+    
     for process in processes:
         main_hwnd = int(process.get("main_hwnd") or 0)
         if main_hwnd and user32.IsWindow(main_hwnd):
             class_name = get_window_class_name(main_hwnd)
-            if class_name == "WeChatMainWndForPC":
+            if class_name == "WeChatMainWndForPC" or "Qt" in class_name:
                 if user32.IsWindowVisible(main_hwnd):
                     return main_hwnd
                 if fallback_main_hwnd is None:
                     fallback_main_hwnd = main_hwnd
 
-    fallback_any_hwnd: Optional[int] = None
     for process in processes:
         hwnds = enum_windows_for_pid(int(process["pid"]), require_visible=False)
         if hwnds:
-            if fallback_any_hwnd is None:
-                fallback_any_hwnd = hwnds[0]
             for hwnd in hwnds:
-                if get_window_class_name(hwnd) == "WeChatMainWndForPC":
+                class_name = get_window_class_name(hwnd)
+                if user32.IsWindowVisible(hwnd):
+                    fallback_visible_hwnd = hwnd
+                if class_name == "WeChatMainWndForPC" or "Qt" in class_name:
                     if user32.IsWindowVisible(hwnd):
                         return hwnd
                     if fallback_main_hwnd is None:
                         fallback_main_hwnd = hwnd
+    
     if fallback_main_hwnd:
         return fallback_main_hwnd
-    if fallback_any_hwnd:
-        return fallback_any_hwnd
-    raise SendError("No visible WeChat window was found.")
+    if fallback_visible_hwnd:
+        return fallback_visible_hwnd
+    
+    for process in processes:
+        hwnds = enum_windows_for_pid(int(process["pid"]), require_visible=False)
+        if hwnds:
+            return hwnds[0]
+    
+    raise SendError("No WeChat window was found.")
 
 
 def get_window_rect(hwnd: int) -> Dict[str, int]:
     rect = wt.RECT()
     if not user32.GetWindowRect(hwnd, ct.byref(rect)):
         raise SendError("Failed to get WeChat window rect.")
+    
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    
+    if width <= 0 or height <= 0 or rect.left < -1000 or rect.top < -1000:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        for _ in range(20):
+            time.sleep(0.1)
+            if user32.GetWindowRect(hwnd, ct.byref(rect)):
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                if width > 200 and height > 200 and rect.left > -1000 and rect.top > -1000:
+                    break
+    
+    if width <= 0 or height <= 0:
+        raise SendError(f"Invalid WeChat window size. Left: {rect.left}, Top: {rect.top}, Right: {rect.right}, Bottom: {rect.bottom}")
+    
     return {
         "left": rect.left,
         "top": rect.top,
         "right": rect.right,
         "bottom": rect.bottom,
-        "width": rect.right - rect.left,
-        "height": rect.bottom - rect.top,
+        "width": width,
+        "height": height,
     }
 
 
@@ -509,7 +536,7 @@ def clear_with_ctrl_a() -> None:
     tap_key(VK_BACK)
 
 
-def capture_screen_region_bgra(*, left: int, top: int, width: int, height: int) -> bytes:
+def capture_screen_region_bgra(*, left: int, top: int, width: int, height: int) -> tuple[int, int, bytes]:
     if width <= 0 or height <= 0:
         raise SendError("Invalid capture region.")
 
@@ -551,7 +578,7 @@ def capture_screen_region_bgra(*, left: int, top: int, width: int, height: int) 
         )
         if scanlines != height:
             raise SendError("Failed to read the captured bitmap.")
-        return bytes(buffer)
+        return (width, height, bytes(buffer))
     finally:
         gdi32.SelectObject(memory_dc, previous)
         gdi32.DeleteObject(bitmap)
@@ -566,16 +593,19 @@ def capture_window_bgra(hwnd: int) -> tuple[int, int, bytes]:
     
     if width <= 0 or height <= 0 or rect["left"] < -1000 or rect["top"] < -1000:
         user32.ShowWindow(hwnd, SW_RESTORE)
-        for _ in range(10):
+        user32.SetForegroundWindow(hwnd)
+        for _ in range(20):
             time.sleep(0.1)
             rect = get_window_rect(hwnd)
             width = rect["width"]
             height = rect["height"]
-            if width > 0 and height > 0 and rect["left"] > -1000 and rect["top"] > -1000:
+            if width > 200 and height > 200 and rect["left"] > -1000 and rect["top"] > -1000:
                 break
         
     if width <= 0 or height <= 0:
         raise SendError("Invalid WeChat window size for capture.")
+    if width < 200 or height < 200:
+        raise SendError("WeChat window is too small for capture.")
 
     window_dc = user32.GetWindowDC(hwnd)
     if not window_dc:
@@ -655,14 +685,15 @@ def capture_window_region_bgra(
     
     if rect["left"] < -1000 or rect["top"] < -1000:
         user32.ShowWindow(hwnd, SW_RESTORE)
-        for _ in range(10):
+        user32.SetForegroundWindow(hwnd)
+        for _ in range(20):
             time.sleep(0.1)
             rect = get_window_rect(hwnd)
-            if rect["left"] > -1000 and rect["top"] > -1000:
+            if rect["width"] > 200 and rect["height"] > 200 and rect["left"] > -1000 and rect["top"] > -1000:
                 break
     
-    if rect["left"] < -1000 or rect["top"] < -1000:
-        raise SendError("WeChat window appears to be minimized. Please restore it first.")
+    if rect["width"] <= 0 or rect["height"] <= 0:
+        raise SendError(f"Invalid WeChat window size. Width: {rect['width']}, Height: {rect['height']}")
     
     local_left = max(0, int(rect["width"] * left_ratio))
     local_top = max(0, int(rect["height"] * top_ratio))
@@ -670,35 +701,21 @@ def capture_window_region_bgra(
     region_height = max(30, int(rect["height"] * height_ratio))
     region_width = min(region_width, rect["width"] - local_left)
     region_height = min(region_height, rect["height"] - local_top)
-
-    try:
-        full_width, _, full_raw = capture_window_bgra(hwnd)
-        return (
-            region_width,
-            region_height,
-            crop_bgra_region(
-                full_raw,
-                full_width=full_width,
-                left=local_left,
-                top=local_top,
-                width=region_width,
-                height=region_height,
-            ),
-        )
-    except SendError:
-        rect = get_window_rect(hwnd)
-        if rect["left"] < -1000 or rect["top"] < -1000:
-            raise SendError("WeChat window appears to be minimized during capture.")
-        return (
-            region_width,
-            region_height,
-            capture_screen_region_bgra(
-                left=rect["left"] + local_left,
-                top=rect["top"] + local_top,
-                width=region_width,
-                height=region_height,
-            ),
-        )
+    
+    if region_width <= 0 or region_height <= 0:
+        raise SendError(f"Invalid capture region. Width: {region_width}, Height: {region_height}")
+    
+    _, _, raw = capture_screen_region_bgra(
+        left=rect["left"] + local_left,
+        top=rect["top"] + local_top,
+        width=region_width,
+        height=region_height,
+    )
+    return (
+        region_width,
+        region_height,
+        raw,
+    )
 
 
 def install_ocr_dependency() -> None:
